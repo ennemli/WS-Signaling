@@ -2,73 +2,123 @@
 import express from "express";
 import http from "http";
 import { WebSocket, WebSocketServer } from "ws";
+import { URL } from 'url';
+
+type WSKeyType = {
+  id: number;
+  role: 'streamer' | 'consumer';
+};
+
+
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-const clients = new Map<number, WebSocket>();
-wss.on("connection", (ws: WebSocket) => {
-  const clientID = Date.now();
 
-  clients.set(clientID, ws);
+const consumers = new Map<WSKeyType, WebSocket>();
+const streamers = new Map<WSKeyType, WebSocket>();
 
-  console.log(`Client connected ${clientID}`);
+const send = (ws: WebSocket, message: any) => {
+  ws.send(JSON.stringify(message));
+}
 
-  // Inform client connected with ClientID
-  ws.send(JSON.stringify({
-    type: "connect",
-    clientID,
-    peers: Array.from(clients.keys()).filter(id => id !== clientID)
-  }));
+wss.on("connection", (ws, req) => {
+  if (!req.url) {
+    ws.terminate();
+    return;
+  }
+  console.log(req.url)
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const params = new URLSearchParams(url.search);
 
-  // Inform peers a new client has connected
-  clients.forEach((client, id) => {
-    if (id != clientID && client.readyState === WebSocket.OPEN) {
-      client.send(JSON.stringify({
-        type: "new-peer",
-        peerID: clientID
-      }));
+  const role = params.get("role");
+
+  if (role === "streamer" || role === "consumer") {
+    const id = Date.now();
+
+    if (role === 'streamer') {
+      streamers.set({
+        id,
+        role
+      }, ws);
+      // Inform Streamer its connection
+      ws.send(JSON.stringify(
+        {
+          type: "connect",
+          id,
+          role
+        }));
+      consumers.forEach((consumer) => {
+        send(consumer, {
+          type: "new-streamer",
+          streamer_id: id
+        });
+      });
+    } else {
+      consumers.set({
+        id,
+        role
+      }, ws);
+      // Inform consumer its connection with available servers
+      send(ws, {
+        type: "connect",
+        id,
+        role,
+        streamers: [...streamers.keys()].map(({ id }) => id)
+      });
     }
-  });
 
-  ws.on("message", (message: string) => {
-    try {
-      const parsedMessage = JSON.parse(message);
+    console.log(`${role} connected ${id}`);
 
-      console.log(`Received ${parsedMessage.type} from client ${clientID}`);
-      if (parsedMessage) {
-        if (parsedMessage.target && clients.has(parsedMessage.target)) {
-          const targetClient = clients.get(parsedMessage.target)!;
-          parsedMessage.sender = clientID;
-          if (targetClient.readyState === WebSocket.OPEN) {
-            targetClient.send(JSON.stringify(parsedMessage));
-            console.log(`Forwared ${parsedMessage.type} to client ${parsedMessage.target}`);
+
+    ws.on("message", (message: string) => {
+      try {
+        const parsedMessage = JSON.parse(message);
+
+        let sessions: Map<WSKeyType, WebSocket>;
+
+        if (role == 'streamer') {
+          sessions = streamers;
+
+        } else {
+          sessions = consumers;
+        }
+
+        console.log(`Received ${parsedMessage.type} from ${role} ${id}}`);
+        if (parsedMessage && parsedMessage.target && sessions.has(parsedMessage.target)) {
+          const targetSession = sessions.get(parsedMessage.target)!;
+
+          if (targetSession.readyState === WebSocket.OPEN) {
+            parsedMessage.sender = id;
+            send(targetSession, parsedMessage);
+            console.log(`Forwared ${parsedMessage.type} to ${parsedMessage.target}`);
           }
         }
-      }
-    } catch (error) {
-      console.error("Error handling message", error);
-    }
-  });
-
-  ws.on("close", () => {
-    console.log(`Client disconnected: ${clientID}`);
-    clients.delete(clientID);
-    clients.forEach((client, id) => {
-      if (client.readyState === WebSocket.OPEN) {
-        client.send(JSON.stringify({
-          type: "peer-disconnected",
-          peerID: clientID
-        }));
-
+      } catch (error) {
+        console.error("Error handling message", error);
       }
     });
-  });
 
-  ws.on("error", (error: Error) => {
-    console.error(`Client ${clientID} error: ${error}`);
-  });
+    ws.on("close", () => {
+      console.log(`${role} disconnected: ${id}`);
+      if (role === 'consumer') {
+        consumers.delete({ role, id });
+        streamers.forEach((streamer) => {
+          send(streamer, {
+            type: "consumer-disconnected",
+            consumerId: id,
+          })
+        });
+      }
+    });
 
+    ws.on("error", (error: Error) => {
+      console.error(`${role} ${id} error: ${error}`);
+    });
+
+  } else {
+    ws.terminate();
+  }
 });
 
 
