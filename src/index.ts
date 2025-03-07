@@ -106,7 +106,7 @@ wss.on("connection", (ws, req) => {
         streamers.forEach((streamer) => {
           send(streamer, {
             type: "consumer-disconnected",
-            consumerId: id,
+            consumer_id: id,
           })
         });
       }
